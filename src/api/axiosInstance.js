@@ -19,10 +19,10 @@ axiosInstance.interceptors.request.use(
 let isRefreshing = false;
 let failedQueue = [];
 
-const processQueue = (error) => {
+const processQueue = (error, token = null) => {
     failedQueue.forEach(prom => {
         if (error) prom.reject(error);
-        else prom.resolve();
+        else prom.resolve(token);
     });
     failedQueue = [];
 };
@@ -32,12 +32,25 @@ axiosInstance.interceptors.response.use(
     async (error) => {
         const originalRequest = error.config;
 
-        if (error.response?.status === 401 && !originalRequest._retry) {
+        if (error.response?.status === 401 || error.response?.status === 403) {
+            // If we already retried the request, it means refresh failed or token is truly invalid.
+            // Log the user out to clear state instead of leaving them stuck with empty data.
+            if (originalRequest._retry) {
+                useAuthStore.getState().logout();
+                window.location.href = '/login';
+                return Promise.reject(error);
+            }
+
             if (isRefreshing) {
                 return new Promise((resolve, reject) => {
                     failedQueue.push({ resolve, reject });
                 })
-                    .then(() => axiosInstance(originalRequest))
+                    .then((token) => {
+                        if (token) {
+                            originalRequest.headers['Authorization'] = `Bearer ${token}`;
+                        }
+                        return axiosInstance(originalRequest);
+                    })
                     .catch(err => Promise.reject(err));
             }
 
@@ -45,12 +58,21 @@ axiosInstance.interceptors.response.use(
             isRefreshing = true;
 
             try {
-                await axios.post(
+                const res = await axios.post(
                     `${API_URL}/api/auth/token/refresh/`,
                     {},
                     { withCredentials: true }
                 );
-                processQueue(null);
+                
+                let newToken = null;
+                // Support case where backend returns token in JSON instead of setting a cookie
+                if (res.data && res.data.access) {
+                    newToken = res.data.access;
+                    axiosInstance.defaults.headers.common['Authorization'] = `Bearer ${newToken}`;
+                    originalRequest.headers['Authorization'] = `Bearer ${newToken}`;
+                }
+
+                processQueue(null, newToken);
                 return axiosInstance(originalRequest);
             } catch (refreshError) {
                 processQueue(refreshError);
